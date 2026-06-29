@@ -19,6 +19,9 @@
 (require 'seq)
 (require 'subr-x)
 
+(defvar lsp-clients-clangd-args)
+(declare-function lsp-session-folders "lsp-mode")
+
 (defgroup project-x nil
   "File-defined projects for project.el."
   :group 'project)
@@ -36,13 +39,19 @@
   :group 'project-x)
 
 (defcustom project-x-default-configuration "Debug"
-  "Default Visual Studio configuration used by `project-x-import-visual-studio-solution'."
+  "Default Visual Studio configuration used by solution imports."
   :type 'string
   :group 'project-x)
 
 (defcustom project-x-default-platform "x64"
-  "Default Visual Studio platform used by `project-x-import-visual-studio-solution'."
+  "Default Visual Studio platform used by solution imports."
   :type 'string
+  :group 'project-x)
+
+(defcustom project-x-vs-project-item-tags
+  '("ClCompile" "ClInclude" "None" "Text" "ResourceCompile" "Image" "MASM")
+  "Visual Studio project item tags imported as project-x files."
+  :type '(repeat string)
   :group 'project-x)
 
 (defcustom project-x-auto-lsp-modes
@@ -138,6 +147,21 @@ headers that are only reachable through compiler include paths."
 (defun project-x--as-directory (path)
   "Return PATH as an expanded directory name."
   (file-name-as-directory (expand-file-name path)))
+
+(defun project-x--path-key (path)
+  "Return normalized PATH for comparisons."
+  (let ((expanded (expand-file-name path)))
+    (if (eq system-type 'windows-nt)
+        (downcase expanded)
+      expanded)))
+
+(defun project-x--directory-key (path)
+  "Return normalized directory PATH for prefix comparisons."
+  (file-name-as-directory (project-x--path-key path)))
+
+(defun project-x--same-file-p (a b)
+  "Return non-nil when A and B identify the same path."
+  (string-equal (project-x--path-key a) (project-x--path-key b)))
 
 (defun project-x--make-project (projx-file data)
   "Create a project-x project object from PROJX-FILE and DATA."
@@ -269,11 +293,37 @@ Relative paths are resolved against BASE, or the project root."
   (let ((path (project-x--import-compile-commands-path project import)))
     (and path (file-exists-p path) path)))
 
+(defun project-x--import-project-files-path (project import)
+  "Return generated Visual Studio project file list path for PROJECT IMPORT."
+  (let* ((configured (project-x--hash-get import "projectFiles"))
+         (solution (project-x--hash-get import "path"))
+         (base-name (if (stringp solution)
+                        (file-name-base solution)
+                      (project-x-name project))))
+    (project-x--expand-path
+     project
+     (or configured
+         (format ".project-x/%s/%s-files.json"
+                 (project-x-name project)
+                 base-name)))))
+
+(defun project-x--import-project-files-file (project import)
+  "Return existing generated Visual Studio project file list for PROJECT IMPORT."
+  (let ((path (project-x--import-project-files-path project import)))
+    (and path (file-exists-p path) path)))
+
 (defun project-x-compile-commands-files (project)
   "Return all compile_commands.json paths referenced by PROJECT."
   (delq nil
         (mapcar (lambda (import)
                   (project-x--import-compile-commands-file project import))
+                (project-x--imports project))))
+
+(defun project-x-project-files-files (project)
+  "Return generated project item list paths referenced by PROJECT."
+  (delq nil
+        (mapcar (lambda (import)
+                  (project-x--import-project-files-file project import))
                 (project-x--imports project))))
 
 (defun project-x--explicit-files (project)
@@ -295,6 +345,19 @@ Relative paths are resolved against BASE, or the project root."
                    (project-x--expand-path project folder)))
                 folders)))
 
+(defun project-x--generated-project-files (project-files)
+  "Return file entries from generated PROJECT-FILES."
+  (when (and project-files (file-readable-p project-files))
+    (seq-uniq
+     (delq nil
+           (mapcar (lambda (file)
+                    (and (stringp file)
+                         (let ((expanded (expand-file-name file)))
+                           (and (file-exists-p expanded) expanded))))
+                  (project-x--string-list
+                   (project-x--json-read-file project-files))))
+     #'string-equal)))
+
 (defun project-x--all-files (project)
   "Return all files for PROJECT."
   (let* ((projx (project-x-file project))
@@ -304,6 +367,8 @@ Relative paths are resolved against BASE, or the project root."
                       (append
                        (project-x--explicit-files project)
                        (project-x--folder-files project)
+                       (seq-mapcat #'project-x--generated-project-files
+                                   (project-x-project-files-files project))
                        (seq-mapcat #'project-x--compile-command-files
                                    (project-x-compile-commands-files project)))
                       #'string-equal)))
@@ -325,25 +390,28 @@ Relative paths are resolved against BASE, or the project root."
 (defun project-x--all-include-dirs (project)
   "Return all include directories for PROJECT."
   (let* ((projx (project-x-file project))
-           (cached (gethash projx project-x--include-dirs-cache)))
+         (cached (gethash projx project-x--include-dirs-cache)))
     (or cached
-          (let ((dirs (seq-uniq
-                       (seq-mapcat #'project-x--compile-command-include-dirs
-                                   (project-x-compile-commands-files project))
-                       #'string-equal)))
-            (puthash projx dirs project-x--include-dirs-cache)
-            dirs))))
+        (let ((dirs (seq-uniq
+                    (seq-mapcat #'project-x--compile-command-include-dirs
+                                (project-x-compile-commands-files project))
+                    #'string-equal)))
+          (puthash projx dirs project-x--include-dirs-cache)
+          dirs))))
 
 (defun project-x--file-in-project-p (file project)
   "Return non-nil if FILE belongs to PROJECT."
-  (let ((expanded (expand-file-name file)))
-    (or (string-prefix-p (project-x-root project) expanded)
-        (member expanded (project-x--all-files project))
+  (let ((expanded (project-x--path-key file)))
+    (or (string-prefix-p (project-x--directory-key (project-x-root project))
+                         expanded)
+        (seq-some (lambda (project-file)
+                    (project-x--same-file-p file project-file))
+                  (project-x--all-files project))
         (seq-some (lambda (dir)
-                    (string-prefix-p (project-x--as-directory dir) expanded))
+                    (string-prefix-p (project-x--directory-key dir) expanded))
                   (project-x--all-source-dirs project))
         (seq-some (lambda (folder)
-                    (let ((dir (project-x--as-directory
+                    (let ((dir (project-x--directory-key
                                 (project-x--expand-path project folder))))
                       (string-prefix-p dir expanded)))
                   (project-x--string-list
@@ -582,8 +650,8 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
         files
       (seq-filter (lambda (file)
                     (seq-some (lambda (dir)
-                                (string-prefix-p (project-x--as-directory dir)
-                                                 (expand-file-name file)))
+                                (string-prefix-p (project-x--directory-key dir)
+                                                 (project-x--path-key file)))
                               dirs))
                   files))))
 
@@ -676,6 +744,52 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
                        (project-x-root project))))
         fallback)))
 
+(defun project-x--sln-project-paths (solution)
+  "Return Visual Studio project paths referenced by SOLUTION."
+  (let ((solution-dir (file-name-directory solution))
+        projects)
+    (with-temp-buffer
+      (insert-file-contents solution)
+      (goto-char (point-min))
+      (while (re-search-forward
+              "^Project(.*) = .*?, \"\\([^\"]+\\)\","
+              nil t)
+        (let ((path (match-string 1)))
+          (when (string-match-p "\\.vcxproj\\'" path)
+            (push (expand-file-name path solution-dir) projects)))))
+    (seq-uniq (nreverse projects) #'string-equal)))
+
+(defun project-x--vs-project-item-files (project-file)
+  "Return files shown by Visual Studio PROJECT-FILE."
+  (let ((project-dir (file-name-directory project-file))
+        files)
+    (when (file-readable-p project-file)
+      (with-temp-buffer
+        (insert-file-contents project-file)
+        (goto-char (point-min))
+        (while (re-search-forward
+                "<\\([[:alnum:]_.:-]+\\)[[:space:]\n]+[^>]*Include=\"\\([^\"]+\\)\""
+                nil t)
+          (let ((tag (match-string 1))
+                (include (match-string 2)))
+            (when (member tag project-x-vs-project-item-tags)
+              (let ((file (expand-file-name include project-dir)))
+                (when (file-exists-p file)
+                  (push file files))))))))
+    (seq-uniq (nreverse files) #'string-equal)))
+
+(defun project-x--refresh-vs-project-files (solution output)
+  "Write Visual Studio project item files for SOLUTION to OUTPUT."
+  (let ((files (seq-mapcat #'project-x--vs-project-item-files
+                           (project-x--sln-project-paths solution))))
+    (make-directory (file-name-directory output) t)
+    (with-temp-file output
+      (insert (json-encode (vconcat (seq-uniq files #'string-equal))))
+      (goto-char (point-min))
+      (when (fboundp 'json-pretty-print-buffer)
+        (json-pretty-print-buffer)))
+    output))
+
 (defun project-x--refresh-vs-solution-import (project import)
   "Refresh Visual Studio solution IMPORT for PROJECT."
   (let* ((solution (project-x--expand-path project
@@ -688,6 +802,7 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
                      (or (project-x--hash-get import "msbuildExtractor")
                          project-x-msbuild-extractor-executable)))
          (output (project-x--import-output-path project import))
+         (project-files (project-x--import-project-files-path project import))
          (output-dir (file-name-directory output))
          (buffer (get-buffer-create "*project-x-refresh*")))
     (unless (and solution (file-exists-p solution))
@@ -703,11 +818,12 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
                                 "-o" output)))
       (if (zerop status)
           (progn
+            (project-x--refresh-vs-project-files solution project-files)
             (remhash (project-x-file project) project-x--files-cache)
             (remhash (project-x-file project) project-x--include-dirs-cache)
             (remhash (project-x-file project) project-x--source-dirs-cache)
-             (message "Updated %s" output)
-             output)
+            (message "Updated %s and %s" output project-files)
+            output)
         (display-buffer buffer)
         (user-error "project-x refresh failed; see %s" (buffer-name buffer))))))
 
@@ -747,6 +863,9 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
   (let* ((projx-file (expand-file-name projx-file))
          (root (file-name-directory projx-file))
          (compile-db (format ".project-x/%s/compile_commands.json" name))
+         (project-files (format ".project-x/%s/%s-files.json"
+                                name
+                                (file-name-base solution)))
          (data `(("name" . ,name)
                  ("files" . [])
                  ("folders" . [])
@@ -756,6 +875,7 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
                                   (puthash "configuration" configuration import)
                                   (puthash "platform" platform import)
                                   (puthash "compileCommands" compile-db import)
+                                  (puthash "projectFiles" project-files import)
                                   import)]))))
     (make-directory root t)
     (with-temp-file projx-file

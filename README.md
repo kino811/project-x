@@ -10,7 +10,8 @@ outputs are spread across multiple directories.
 ## Features
 
 - `.projx` project files backed by Emacs `project.el`.
-- File search across explicit files, folders, and `compile_commands.json`.
+- File search across explicit files, folders, Visual Studio project items, and
+  `compile_commands.json`.
 - Visual Studio solution import through an external MSBuild extractor.
 - C/C++ `lsp-mode` integration with project-specific `compile_commands.json`.
 - Buffer-local project context for shared source files used by multiple
@@ -58,13 +59,17 @@ Example:
       "path": "example.sln",
       "configuration": "Debug",
       "platform": "x64",
-      "compileCommands": ".project-x/example/compile_commands.json"
+      "compileCommands": ".project-x/example/compile_commands.json",
+      "projectFiles": ".project-x/example/example-files.json"
     }
   ]
 }
 ```
 
 Paths are resolved relative to the `.projx` file unless already absolute.
+For Visual Studio imports, `projectFiles` is generated from the `.vcxproj`
+items that Visual Studio shows, including files excluded from direct
+compilation and therefore absent from `compile_commands.json`.
 
 ## LSP behavior
 
