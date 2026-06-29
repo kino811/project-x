@@ -74,6 +74,9 @@ headers that are only reachable through compiler include paths."
   "C:/Users/myjung/tools/bin/msbuild-extractor-sample/msbuild-extractor-sample.exe"
   "Fallback path for the MSBuild extractor installed on this machine.")
 
+(defconst project-x--cache-miss (make-symbol "project-x-cache-miss")
+  "Sentinel for cached nil values.")
+
 (defvar project-x--active-project nil
   "Default project-x project object.")
 
@@ -95,8 +98,23 @@ headers that are only reachable through compiler include paths."
 (defvar project-x--source-dirs-cache (make-hash-table :test 'equal)
   "Cache of source directories keyed by .projx file path.")
 
+(defvar project-x--membership-cache (make-hash-table :test 'equal)
+  "Cache of normalized membership data keyed by .projx file path.")
+
+(defvar project-x--projects-for-file-cache (make-hash-table :test 'equal)
+  "Cache of loaded project-x projects keyed by normalized file path.")
+
+(defvar project-x--path-key-cache (make-hash-table :test 'equal)
+  "Cache of normalized absolute path keys.")
+
 (defvar project-x-mode-line-string ""
   "Compatibility variable for older project-x mode-line entries.")
+
+(defvar-local project-x--cached-mode-line-string ""
+  "Cached project-x mode-line text for the current buffer.")
+
+(defvar-local project-x--mode-line-cache-state nil
+  "State used to avoid unnecessary project-x mode-line cache refreshes.")
 
 (defvar-keymap project-x-map
   :doc "Keymap for project-x commands."
@@ -150,10 +168,16 @@ headers that are only reachable through compiler include paths."
 
 (defun project-x--path-key (path)
   "Return normalized PATH for comparisons."
-  (let ((expanded (expand-file-name path)))
-    (if (eq system-type 'windows-nt)
-        (downcase expanded)
-      expanded)))
+  (let ((cacheable (and (stringp path)
+                        (or (file-name-absolute-p path)
+                            (string-prefix-p "~" path)))))
+    (or (and cacheable (gethash path project-x--path-key-cache))
+        (let ((expanded (expand-file-name path)))
+          (when (eq system-type 'windows-nt)
+            (setq expanded (downcase expanded)))
+          (when cacheable
+            (puthash path expanded project-x--path-key-cache))
+          expanded))))
 
 (defun project-x--directory-key (path)
   "Return normalized directory PATH for prefix comparisons."
@@ -203,8 +227,19 @@ headers that are only reachable through compiler include paths."
       (let* ((data (project-x--json-read-file file))
              (project (project-x--make-project file data)))
         (puthash file (cons mtime project) project-x--project-cache)
-        (remhash file project-x--files-cache)
+        (project-x--clear-project-derived-caches file)
         project))))
+
+(defun project-x--clear-project-derived-caches (project-or-file)
+  "Clear derived caches for PROJECT-OR-FILE."
+  (let ((file (if (stringp project-or-file)
+                  project-or-file
+                (project-x-file project-or-file))))
+    (remhash file project-x--files-cache)
+    (remhash file project-x--include-dirs-cache)
+    (remhash file project-x--source-dirs-cache)
+    (remhash file project-x--membership-cache)
+    (clrhash project-x--projects-for-file-cache)))
 
 (defun project-x--expand-path (project path &optional base)
   "Expand PATH for PROJECT.
@@ -399,23 +434,53 @@ Relative paths are resolved against BASE, or the project root."
           (puthash projx dirs project-x--include-dirs-cache)
           dirs))))
 
+(defun project-x--membership-data (project)
+  "Return normalized membership data for PROJECT."
+  (let* ((projx (project-x-file project))
+         (cached (gethash projx project-x--membership-cache)))
+    (or cached
+        (let ((files (make-hash-table :test 'equal))
+             (source-dirs (mapcar #'project-x--directory-key
+                                  (project-x--all-source-dirs project)))
+             (folder-dirs
+              (delq nil
+                    (mapcar (lambda (folder)
+                              (when-let* ((path (project-x--expand-path
+                                                 project folder)))
+                                (project-x--directory-key path)))
+                            (project-x--string-list
+                             (project-x--hash-get
+                              (project-x-data project) "folders"))))))
+          (dolist (file (project-x--all-files project))
+           (puthash (project-x--path-key file) t files))
+          (setq cached
+               (list :root (project-x--directory-key (project-x-root project))
+                     :files files
+                     :source-dirs source-dirs
+                     :folder-dirs folder-dirs
+                     :contains (make-hash-table :test 'equal)))
+          (puthash projx cached project-x--membership-cache)
+          cached))))
+
 (defun project-x--file-in-project-p (file project)
   "Return non-nil if FILE belongs to PROJECT."
-  (let ((expanded (project-x--path-key file)))
-    (or (string-prefix-p (project-x--directory-key (project-x-root project))
-                         expanded)
-        (seq-some (lambda (project-file)
-                    (project-x--same-file-p file project-file))
-                  (project-x--all-files project))
-        (seq-some (lambda (dir)
-                    (string-prefix-p (project-x--directory-key dir) expanded))
-                  (project-x--all-source-dirs project))
-        (seq-some (lambda (folder)
-                    (let ((dir (project-x--directory-key
-                                (project-x--expand-path project folder))))
-                      (string-prefix-p dir expanded)))
-                  (project-x--string-list
-                   (project-x--hash-get (project-x-data project) "folders"))))))
+  (when (and (stringp file) project)
+    (let* ((expanded (project-x--path-key file))
+          (membership (project-x--membership-data project))
+          (contains (plist-get membership :contains))
+          (cached (gethash expanded contains project-x--cache-miss)))
+      (if (not (eq cached project-x--cache-miss))
+          cached
+        (puthash expanded
+                (or (string-prefix-p (plist-get membership :root) expanded)
+                    (gethash expanded (plist-get membership :files))
+                    (seq-some (lambda (dir)
+                                (string-prefix-p dir expanded))
+                              (plist-get membership :source-dirs))
+                    (seq-some (lambda (dir)
+                                (string-prefix-p dir expanded))
+                              (plist-get membership :folder-dirs)))
+                contains)))))
 
 (defun project-x--known-projects ()
   "Return all loaded project-x projects."
@@ -433,9 +498,16 @@ Relative paths are resolved against BASE, or the project root."
 (defun project-x--projects-for-file (file)
   "Return loaded project-x projects that contain FILE."
   (when (stringp file)
-    (seq-filter (lambda (project)
-                 (project-x--file-in-project-p file project))
-               (project-x--known-projects))))
+    (let* ((key (project-x--path-key file))
+           (cached (gethash key project-x--projects-for-file-cache
+                           project-x--cache-miss)))
+      (if (not (eq cached project-x--cache-miss))
+          cached
+        (puthash key
+                 (seq-filter (lambda (project)
+                              (project-x--file-in-project-p file project))
+                            (project-x--known-projects))
+                 project-x--projects-for-file-cache)))))
 
 (defun project-x--single-project-for-file (file)
   "Return the only loaded project-x project containing FILE.
@@ -483,19 +555,23 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
 (defun project-x-current-project ()
   "Return the project-x project for the current buffer."
   (or project-x-buffer-project
-      (setq-local project-x-buffer-project
-                 (project-x--preferred-project-for-file buffer-file-name))))
+      (let ((project (project-x--preferred-project-for-file buffer-file-name)))
+        (when project
+          (project-x--set-buffer-project project))
+        project)))
 
 (defun project-x--set-buffer-project (project)
   "Associate PROJECT with the current buffer."
+  (setq-local project-x-buffer-project project)
+  (project-x--refresh-mode-line-cache t)
   (when project
-    (setq-local project-x-buffer-project project)
-    (project-x--apply-lsp-args project)
-    (force-mode-line-update)))
+    (project-x--apply-lsp-args project))
+  (force-mode-line-update))
 
 (defun project-x--ensure-buffer-project ()
   "Ensure the current buffer has a project-x project when one can be inferred."
-  (project-x--set-buffer-project (project-x-current-project)))
+  (or (project-x-current-project)
+      (project-x--refresh-mode-line-cache)))
 
 (defun project-x--auto-lsp-file-p ()
   "Return non-nil when current buffer should auto-start LSP for project-x."
@@ -515,22 +591,7 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
 
 (defun project-x--mode-line-string ()
   "Return compact project status text for the mode-line."
-  (let* ((project (or (and project-x-buffer-project
-                           (or (not buffer-file-name)
-                               (project-x--file-in-project-p buffer-file-name
-                                                             project-x-buffer-project))
-                           project-x-buffer-project)
-                      (and buffer-file-name
-                           (project-x--preferred-project-for-file buffer-file-name))))
-         (projectile (and (not project)
-                          (project-x--projectile-status-name)))
-         (items (delq nil
-                      (list
-                       (and project (format "ProjX[%s]" (project-x-name project)))
-                       (and projectile (format "Projectile[%s]" projectile))))))
-    (if items
-        (concat " " (string-join items " "))
-      "")))
+  project-x--cached-mode-line-string)
 
 (defun project-x--short-directory-name (directory)
   "Return a short display name for DIRECTORY."
@@ -542,6 +603,34 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
   (when (fboundp 'projectile-project-root)
     (project-x--short-directory-name
      (ignore-errors (projectile-project-root)))))
+
+(defun project-x--build-mode-line-string ()
+  "Build cached project status text for the current buffer."
+  (let* ((project project-x-buffer-project)
+         (projectile (and (not project)
+                          (project-x--projectile-status-name)))
+         (items (delq nil
+                      (list
+                       (and project (format "ProjX[%s]" (project-x-name project)))
+                       (and projectile (format "Projectile[%s]" projectile))))))
+    (if items
+        (concat " " (string-join items " "))
+      "")))
+
+(defun project-x--refresh-mode-line-cache (&optional force)
+  "Refresh cached project-x mode-line text for the current buffer."
+  (let ((state (list buffer-file-name default-directory
+                     project-x-buffer-project project-x--active-project)))
+    (when (or force (not (equal state project-x--mode-line-cache-state)))
+      (setq-local project-x--mode-line-cache-state state)
+      (setq-local project-x--cached-mode-line-string
+                  (project-x--build-mode-line-string))
+      (setq-local project-x-mode-line-string
+                  project-x--cached-mode-line-string))))
+
+(defun project-x--refresh-current-buffer-mode-line-cache ()
+  "Refresh cached project-x mode-line text for the current buffer if needed."
+  (project-x--refresh-mode-line-cache))
 
 (defun project-x--with-context-project (orig-fun &rest args)
   "Call ORIG-FUN with the current project-x project available to new buffers."
@@ -819,9 +908,7 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
       (if (zerop status)
           (progn
             (project-x--refresh-vs-project-files solution project-files)
-            (remhash (project-x-file project) project-x--files-cache)
-            (remhash (project-x-file project) project-x--include-dirs-cache)
-            (remhash (project-x-file project) project-x--source-dirs-cache)
+            (project-x--clear-project-derived-caches project)
             (message "Updated %s and %s" output project-files)
             output)
         (display-buffer buffer)
@@ -839,9 +926,7 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
         ("visual-studio-solution"
          (push (project-x--refresh-vs-solution-import project import) outputs))
         (_ nil)))
-    (remhash (project-x-file project) project-x--files-cache)
-    (remhash (project-x-file project) project-x--include-dirs-cache)
-    (remhash (project-x-file project) project-x--source-dirs-cache)
+    (project-x--clear-project-derived-caches project)
     (message "project-x refresh complete: %d output(s)" (length outputs))
     (nreverse outputs)))
 
@@ -902,6 +987,8 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
           (append global-mode-string '((:eval (project-x--mode-line-string))))))
   (add-hook 'find-file-hook #'project-x--ensure-buffer-project)
   (add-hook 'find-file-hook #'project-x-maybe-start-lsp)
+  (add-hook 'buffer-list-update-hook
+            #'project-x--refresh-current-buffer-mode-line-cache)
   (project-x--advice-add-once 'xref-find-definitions
                               :around #'project-x--with-context-project)
   (project-x--advice-add-once 'xref-find-definitions-other-window
