@@ -82,6 +82,14 @@ If the same source file belongs to multiple loaded `.projx` projects,
 with `project-x-find-file` does not overwrite that buffer context. Use
 `project-x-switch-buffer-project` to change it explicitly.
 
+Project membership has two levels. Primary membership covers project files,
+folders, Visual Studio project items, and `compile_commands.json` entries.
+Files that are only reachable through compiler include directories, such as SDK
+or third-party headers, are secondary members. Secondary membership applies when
+a file is opened through a definition jump, `project-x-find-file`, or
+`project-x-switch-buffer-project`, so those buffers keep the originating
+project. Opening such a file directly does not attach a project-x context.
+
 ## Customization
 
 Important options:

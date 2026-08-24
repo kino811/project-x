@@ -450,7 +450,9 @@ Relative paths are resolved against BASE, or the project root."
                                 (project-x--directory-key path)))
                             (project-x--string-list
                              (project-x--hash-get
-                              (project-x-data project) "folders"))))))
+                              (project-x-data project) "folders")))))
+             (include-dirs (mapcar #'project-x--directory-key
+                                   (project-x--all-include-dirs project))))
           (dolist (file (project-x--all-files project))
            (puthash (project-x--path-key file) t files))
           (setq cached
@@ -458,16 +460,24 @@ Relative paths are resolved against BASE, or the project root."
                      :files files
                      :source-dirs source-dirs
                      :folder-dirs folder-dirs
-                     :contains (make-hash-table :test 'equal)))
+                     :include-dirs include-dirs
+                     :contains (make-hash-table :test 'equal)
+                     :contains-include (make-hash-table :test 'equal)))
           (puthash projx cached project-x--membership-cache)
           cached))))
 
-(defun project-x--file-in-project-p (file project)
-  "Return non-nil if FILE belongs to PROJECT."
+(defun project-x--file-in-project-p (file project &optional include-dirs)
+  "Return non-nil if FILE belongs to PROJECT.
+Primary membership covers project files, folders, and imported project
+items.  With INCLUDE-DIRS non-nil, also accept files that are only
+reachable through compiler include directories, such as SDK headers
+opened by definition jumps."
   (when (and (stringp file) project)
     (let* ((expanded (project-x--path-key file))
           (membership (project-x--membership-data project))
-          (contains (plist-get membership :contains))
+          (contains (plist-get membership (if include-dirs
+                                              :contains-include
+                                            :contains)))
           (cached (gethash expanded contains project-x--cache-miss)))
       (if (not (eq cached project-x--cache-miss))
           cached
@@ -479,7 +489,11 @@ Relative paths are resolved against BASE, or the project root."
                               (plist-get membership :source-dirs))
                     (seq-some (lambda (dir)
                                 (string-prefix-p dir expanded))
-                              (plist-get membership :folder-dirs)))
+                              (plist-get membership :folder-dirs))
+                    (and include-dirs
+                         (seq-some (lambda (dir)
+                                     (string-prefix-p dir expanded))
+                                   (plist-get membership :include-dirs))))
                 contains)))))
 
 (defun project-x--known-projects ()
@@ -495,17 +509,19 @@ Relative paths are resolved against BASE, or the project root."
               (lambda (a b)
                 (string-equal (project-x-file a) (project-x-file b))))))
 
-(defun project-x--projects-for-file (file)
-  "Return loaded project-x projects that contain FILE."
+(defun project-x--projects-for-file (file &optional include-dirs)
+  "Return loaded project-x projects that contain FILE.
+INCLUDE-DIRS extends membership to compiler include directories."
   (when (stringp file)
-    (let* ((key (project-x--path-key file))
+    (let* ((key (cons (project-x--path-key file) (and include-dirs t)))
            (cached (gethash key project-x--projects-for-file-cache
                            project-x--cache-miss)))
       (if (not (eq cached project-x--cache-miss))
           cached
         (puthash key
                  (seq-filter (lambda (project)
-                              (project-x--file-in-project-p file project))
+                              (project-x--file-in-project-p file project
+                                                            include-dirs))
                             (project-x--known-projects))
                  project-x--projects-for-file-cache)))))
 
@@ -522,7 +538,7 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
 
 (defun project-x--read-project-for-file (file)
   "Read a project-x project containing FILE from minibuffer."
-  (let ((projects (project-x--projects-for-file file)))
+  (let ((projects (project-x--projects-for-file file t)))
     (pcase projects
       ('nil
        (user-error "No loaded project-x project contains this file"))
@@ -537,14 +553,17 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
          (cdr (assoc choice choices)))))))
 
 (defun project-x--preferred-project-for-file (file)
-  "Return the preferred project-x project for FILE without guessing ambiguities."
+  "Return the preferred project-x project for FILE.
+Buffer context and definition-jump context accept include-directory
+membership so that SDK headers keep the originating project.  Automatic
+context from the active project only accepts primary project files."
   (or (and project-x-buffer-project
            (or (not (stringp file))
-              (project-x--file-in-project-p file project-x-buffer-project))
+              (project-x--file-in-project-p file project-x-buffer-project t))
            project-x-buffer-project)
       (and project-x--context-project
            (stringp file)
-           (project-x--file-in-project-p file project-x--context-project)
+           (project-x--file-in-project-p file project-x--context-project t)
            project-x--context-project)
       (and project-x--active-project
            (stringp file)
@@ -579,7 +598,7 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
     (and buffer-file-name
          (memq major-mode project-x-auto-lsp-modes)
          (or (not project-x-auto-lsp-strict-membership)
-             (project-x--file-in-project-p buffer-file-name project)))))
+             (project-x--file-in-project-p buffer-file-name project t)))))
 
 (defun project-x-maybe-start-lsp ()
   "Start LSP in project-x C/C++ buffers only."
@@ -633,9 +652,18 @@ Return nil when FILE belongs to no loaded project or to multiple projects."
   (project-x--refresh-mode-line-cache))
 
 (defun project-x--with-context-project (orig-fun &rest args)
-  "Call ORIG-FUN with the current project-x project available to new buffers."
-  (let ((project-x--context-project (project-x-current-project)))
-    (apply orig-fun args)))
+  "Call ORIG-FUN with the current project-x project available to new buffers.
+Also attach the context project to the destination buffer, because
+revisiting an already open buffer does not run `find-file-hook'."
+  (let* ((context (project-x-current-project))
+         (project-x--context-project context))
+    (prog1 (apply orig-fun args)
+      (when (and context
+                 (not project-x-buffer-project)
+                 buffer-file-name
+                 (project-x--file-in-project-p buffer-file-name context t))
+        (project-x--set-buffer-project context)
+        (project-x-maybe-start-lsp)))))
 
 (defun project-x--with-current-lsp-args (orig-fun &rest args)
   "Apply current buffer's project-x LSP settings before calling ORIG-FUN."
