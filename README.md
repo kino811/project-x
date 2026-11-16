@@ -34,11 +34,20 @@ Default `project-x-map` bindings:
 
 | Key | Command | Description |
 | --- | --- | --- |
-| `C-c p x o` | `project-x-open` | Open and activate a `.projx` project. |
+| `C-c p x o o` | `project-x-open` | Open and activate a `.projx` project. |
+| `C-c p x o p` | `project-x-open-recent` | Reopen a recently activated `.projx` project. |
+| `C-c p x c c` | `project-x-close` | Deactivate the active project and detach its buffers. |
 | `C-c p x f` | `project-x-find-file` | Find a file in the current project-x project. |
 | `C-c p x r` | `project-x-refresh` | Refresh imported build metadata. |
 | `C-c p x i` | `project-x-import-visual-studio-solution` | Create a `.projx` from a Visual Studio solution. |
 | `C-c p x s` | `project-x-switch-buffer-project` | Select the project-x context for the current buffer. |
+
+Recently activated `.projx` paths are saved in
+`project-x-recent-projects-file`, so `C-c p x o p` remains available after
+restarting Emacs.
+
+Closing a project-x project does not stop existing LSP sessions. Restart LSP
+only when a buffer needs a different compile context.
 
 ## `.projx` format
 
@@ -71,11 +80,67 @@ For Visual Studio imports, `projectFiles` is generated from the `.vcxproj`
 items that Visual Studio shows, including files excluded from direct
 compilation and therefore absent from `compile_commands.json`.
 
+Imported source files and include directories share one native JSON parse per
+compilation database when project metadata is first needed. Only the derived
+path lists are cached, not the full compilation database. Include paths are
+deduplicated before expansion and filesystem checks, including equivalent
+expanded paths. Refresh and `.projx` reload invalidate this metadata together
+with the existing membership caches.
+
+## Bulk-build compile commands
+
+`project-x-refresh` supplements the extracted compilation database for source
+files directly included by a compiled bulk/unity source. It recognizes literal
+quoted includes such as `#include "../src/example.cpp"` without relying on a
+particular bulk-file naming convention. Missing individual commands inherit the
+bulk command's include paths, macros and forced includes, replacing only the
+standalone source argument. Existing individual commands are never overwritten.
+
+This prevents clangd from guessing a PCH-creation command for a source that is
+actually built through a bulk file. Each refresh starts from a new extraction;
+previously derived commands are not carried over.
+
+The `*project-x-refresh*` buffer reports added commands and warnings. Conditional
+source includes, multiple owners, missing sources and angle-bracket source
+includes are not guessed. Derivation requires an `arguments` array with exactly
+one standalone source operand; command-only entries, response files, PCH-creation
+commands and joined source switches such as `/Tpfile.cpp` are reported and left
+unchanged. Comments and C++ strings are ignored. Only direct source includes are
+expanded, not macro includes, recursively included sources or compiler
+include-search paths.
+
+The extractor and postprocessing write staging files. The existing compilation
+database is replaced by a same-directory rename only after extraction,
+augmentation and project-file generation succeed. Failures before publication
+leave the old database in place and clean up the staging files. The project-file
+list is published separately; the two files are not a transactional pair.
+
+Derived commands describe a source parsed individually with the bulk build's
+options. They do not reproduce declarations or macros contributed by earlier
+`.cpp` includes in the bulk file, and do not resolve compiler compatibility
+errors. Refresh does not reload this package into a running Emacs.
+
 ## LSP behavior
 
 When a project-x C/C++ buffer starts LSP, `project-x` sets clangd's
 `--compile-commands-dir` from the current project. The LSP workspace root also
 prefers the buffer's project-x root over Projectile or other project roots.
+
+After all imports refresh successfully, `project-x-refresh` restarts each
+existing clangd workspace attached to the project's open file buffers once.
+The association uses the buffer's `.projx` identity, not its source directory.
+Sources and headers sharing a workspace are reconnected by lsp-mode together.
+This prevents old diagnostics from surviving a compilation database refresh.
+No new servers are started for files without LSP, and unrelated workspaces are
+left alone. A failed refresh does not request any restarts.
+
+If a workspace also serves file buffers outside the refreshed project,
+confirmation lists the affected buffers. Declining skips that workspace;
+batch mode skips shared workspaces without prompting. Restarts are asynchronous:
+the refresh report distinguishes requested, skipped and failed restarts from
+database publication, notifies restart-call failures, and does not claim that
+reanalysis has already completed. Later server startup errors remain in LSP's
+own logs. Set `project-x-refresh-restart-lsp` to nil to keep LSP unchanged.
 
 If the same source file belongs to multiple loaded `.projx` projects,
 `project-x` keeps a buffer-local project context. Reopening an already open file
@@ -99,8 +164,22 @@ Important options:
 (setq project-x-default-configuration "Debug")
 (setq project-x-default-platform "x64")
 (setq project-x-auto-lsp-strict-membership nil)
+(setq project-x-refresh-restart-lsp t)
 ```
 
 `project-x-auto-lsp-strict-membership` is nil by default so headers opened via
 definition jumps can still start LSP even when they are not direct
 `compile_commands.json` entries.
+
+## Isolated checks
+
+Run from this directory in a separate Emacs, not by loading development code
+into an existing editor:
+
+```powershell
+emacs --batch -Q -L . -l project-x-tests.el -f ert-run-tests-batch-and-exit
+emacs --batch -Q -L . --eval '(setq byte-compile-error-on-warn t)' -f batch-byte-compile project-x.el project-x-tests.el
+```
+
+Tests use disposable source/database fixtures, a stubbed MSBuild extractor,
+and mocked LSP workspaces. They do not restart a real language server.

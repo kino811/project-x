@@ -21,6 +21,12 @@
 
 (defvar lsp-clients-clangd-args)
 (declare-function lsp-session-folders "lsp-mode")
+(declare-function lsp-workspaces "lsp-mode")
+(declare-function lsp--workspace-server-id "lsp-mode")
+(declare-function lsp--workspace-proc "lsp-mode")
+(declare-function lsp--workspace-buffers "lsp-mode")
+(declare-function lsp--workspace-root "lsp-mode")
+(declare-function lsp-workspace-restart "lsp-mode")
 
 (defgroup project-x nil
   "File-defined projects for project.el."
@@ -31,9 +37,15 @@
   :type 'string
   :group 'project-x)
 
+(defcustom project-x-recent-projects-file
+  (locate-user-emacs-file "project-x-recent-projects")
+  "File used to persist recently activated project-x project files."
+  :type 'file
+  :group 'project-x)
+
 (defcustom project-x-msbuild-extractor-executable
   (or (executable-find "msbuild-extractor-sample")
-      "C:/Users/myjung/tools/bin/msbuild-extractor-sample/msbuild-extractor-sample.exe")
+      (expand-file-name "~/tools/bin/msbuild-extractor-sample/msbuild-extractor-sample.exe"))
   "Executable used to extract compile_commands.json from Visual Studio solutions."
   :type 'string
   :group 'project-x)
@@ -70,8 +82,16 @@ headers that are only reachable through compiler include paths."
   :type 'boolean
   :group 'project-x)
 
+(defcustom project-x-refresh-restart-lsp t
+  "Restart existing project clangd workspaces after a successful refresh.
+Only workspaces attached to file buffers associated with the refreshed
+project are considered.  Shared workspaces require confirmation and are
+skipped in batch mode.  No language servers are started for unmanaged files."
+  :type 'boolean
+  :group 'project-x)
+
 (defconst project-x--default-msbuild-extractor-path
-  "C:/Users/myjung/tools/bin/msbuild-extractor-sample/msbuild-extractor-sample.exe"
+  (expand-file-name "~/tools/bin/msbuild-extractor-sample/msbuild-extractor-sample.exe")
   "Fallback path for the MSBuild extractor installed on this machine.")
 
 (defconst project-x--cache-miss (make-symbol "project-x-cache-miss")
@@ -95,6 +115,9 @@ headers that are only reachable through compiler include paths."
 (defvar project-x--include-dirs-cache (make-hash-table :test 'equal)
   "Cache of include directories keyed by .projx file path.")
 
+(defvar project-x--compile-metadata-cache (make-hash-table :test 'equal)
+  "Cache of imported source files and include dirs keyed by .projx file path.")
+
 (defvar project-x--source-dirs-cache (make-hash-table :test 'equal)
   "Cache of source directories keyed by .projx file path.")
 
@@ -107,6 +130,12 @@ headers that are only reachable through compiler include paths."
 (defvar project-x--path-key-cache (make-hash-table :test 'equal)
   "Cache of normalized absolute path keys.")
 
+(defvar project-x--recent-project-files nil
+  "Recently activated project-x project file paths.")
+
+(defvar project-x--recent-projects-loaded nil
+  "Non-nil after `project-x--recent-project-files' has been loaded.")
+
 (defvar project-x-mode-line-string ""
   "Compatibility variable for older project-x mode-line entries.")
 
@@ -116,9 +145,19 @@ headers that are only reachable through compiler include paths."
 (defvar-local project-x--mode-line-cache-state nil
   "State used to avoid unnecessary project-x mode-line cache refreshes.")
 
+(defvar-keymap project-x-open-map
+  :doc "Keymap for opening project-x projects."
+  "o" #'project-x-open
+  "p" #'project-x-open-recent)
+
+(defvar-keymap project-x-close-map
+  :doc "Keymap for closing project-x projects."
+  "c" #'project-x-close)
+
 (defvar-keymap project-x-map
   :doc "Keymap for project-x commands."
-  "o" #'project-x-open
+  "o" project-x-open-map
+  "c" project-x-close-map
   "i" #'project-x-import-visual-studio-solution
   "r" #'project-x-refresh
   "f" #'project-x-find-file
@@ -141,12 +180,10 @@ headers that are only reachable through compiler include paths."
 
 (defun project-x--json-read-file (file)
   "Read JSON object from FILE as hash tables and vectors."
-  (let ((json-object-type 'hash-table)
-        (json-array-type 'vector)
-        (json-key-type 'string)
-        (json-false nil)
-        (json-null nil))
-    (json-read-file file)))
+  (with-temp-buffer
+    (insert-file-contents file)
+    (json-parse-buffer :object-type 'hash-table :array-type 'array
+                       :false-object nil :null-object nil)))
 
 (defun project-x--project-file-p (file)
   "Return non-nil when FILE is a project-x project file."
@@ -186,6 +223,59 @@ headers that are only reachable through compiler include paths."
 (defun project-x--same-file-p (a b)
   "Return non-nil when A and B identify the same path."
   (string-equal (project-x--path-key a) (project-x--path-key b)))
+
+(defun project-x--read-recent-project-files ()
+  "Load and return recently activated project-x project files."
+  (unless project-x--recent-projects-loaded
+    (setq project-x--recent-projects-loaded t)
+    (setq project-x--recent-project-files
+          (when (file-readable-p project-x-recent-projects-file)
+            (condition-case err
+                (with-temp-buffer
+                  (insert-file-contents project-x-recent-projects-file)
+                  (seq-filter #'stringp (read (current-buffer))))
+              (end-of-file nil)
+              (error
+               (display-warning
+                'project-x
+                (format "Cannot read recent project-x projects from %s: %s"
+                        project-x-recent-projects-file
+                        (error-message-string err))
+                :warning)
+               nil)))))
+  project-x--recent-project-files)
+
+(defun project-x--write-recent-project-files ()
+  "Persist recently activated project-x project files."
+  (make-directory (file-name-directory project-x-recent-projects-file) t)
+  (with-temp-file project-x-recent-projects-file
+    (let ((print-length nil)
+          (print-level nil))
+      (prin1 project-x--recent-project-files (current-buffer))
+      (insert "\n"))))
+
+(defun project-x--remember-project-file (projx-file)
+  "Record PROJX-FILE as the most recently activated project-x project."
+  (project-x--read-recent-project-files)
+  (let ((file (expand-file-name projx-file)))
+    (setq project-x--recent-project-files
+          (cons file
+                (seq-remove (lambda (entry)
+                              (project-x--same-file-p entry file))
+                            project-x--recent-project-files)))
+    (project-x--write-recent-project-files)))
+
+(defun project-x--recent-project-candidates ()
+  "Return readable recent project-x files, pruning stale entries."
+  (let* ((recent (project-x--read-recent-project-files))
+         (available (seq-filter (lambda (file)
+                                  (and (project-x--project-file-p file)
+                                       (file-readable-p file)))
+                                recent)))
+    (unless (equal available recent)
+      (setq project-x--recent-project-files available)
+      (project-x--write-recent-project-files))
+    available))
 
 (defun project-x--make-project (projx-file data)
   "Create a project-x project object from PROJX-FILE and DATA."
@@ -237,6 +327,7 @@ headers that are only reachable through compiler include paths."
                 (project-x-file project-or-file))))
     (remhash file project-x--files-cache)
     (remhash file project-x--include-dirs-cache)
+    (remhash file project-x--compile-metadata-cache)
     (remhash file project-x--source-dirs-cache)
     (remhash file project-x--membership-cache)
     (clrhash project-x--projects-for-file-cache)))
@@ -268,17 +359,16 @@ Relative paths are resolved against BASE, or the project root."
       configured
       project-x-msbuild-extractor-executable))
 
-(defun project-x--compile-command-files (compile-commands)
-  "Return file entries from COMPILE-COMMANDS."
+(defun project-x--compile-command-files (compile-commands &optional entries)
+  "Return file entries from COMPILE-COMMANDS, reusing parsed ENTRIES if supplied."
   (when (and compile-commands (file-readable-p compile-commands))
-    (let* ((entries (project-x--json-read-file compile-commands)))
+    (let ((entries (or entries (project-x--json-read-file compile-commands))))
       (seq-uniq
        (delq nil
              (mapcar (lambda (entry)
                        (let ((file (project-x--hash-get entry "file")))
                          (and (stringp file) (expand-file-name file))))
-                     (append entries nil)))
-       #'string-equal))))
+                     (append entries nil)))))))
 
 (defun project-x--compile-command-arguments (entry)
   "Return command-line arguments from compile command ENTRY."
@@ -299,10 +389,10 @@ Relative paths are resolved against BASE, or the project root."
    ((string-prefix-p "/external:I" arg) (substring arg (length "/external:I")))
    (t nil)))
 
-(defun project-x--compile-command-include-dirs (compile-commands)
-  "Return include directories from COMPILE-COMMANDS."
+(defun project-x--compile-command-include-dirs (compile-commands &optional entries)
+  "Return include dirs from COMPILE-COMMANDS, reusing parsed ENTRIES if supplied."
   (when (and compile-commands (file-readable-p compile-commands))
-    (let* ((entries (project-x--json-read-file compile-commands))
+    (let* ((entries (or entries (project-x--json-read-file compile-commands)))
            dirs)
       (dolist (entry (append entries nil))
         (let ((args (project-x--compile-command-arguments entry)))
@@ -312,9 +402,14 @@ Relative paths are resolved against BASE, or the project root."
                    (path (and (stringp arg)
                               (project-x--include-argument-path arg next))))
               (when (and path (not (string-empty-p path)))
-                (push (file-name-as-directory (expand-file-name path)) dirs)))
+                (push path dirs)))
             (setq args (cdr args)))))
-      (seq-uniq (seq-filter #'file-directory-p dirs) #'string-equal))))
+      (seq-filter
+       #'file-directory-p
+       (seq-uniq
+        (mapcar (lambda (path)
+                  (file-name-as-directory (expand-file-name path)))
+                (seq-uniq dirs)))))))
 
 (defun project-x--import-compile-commands-path (project import)
   "Return configured compile_commands.json path for PROJECT IMPORT."
@@ -361,6 +456,23 @@ Relative paths are resolved against BASE, or the project root."
                   (project-x--import-project-files-file project import))
                 (project-x--imports project))))
 
+(defun project-x--imported-compile-metadata (project)
+  "Return cached source files and include dirs from PROJECT compilation databases."
+  (let* ((projx (project-x-file project))
+         (cached (gethash projx project-x--compile-metadata-cache)))
+    (or cached
+        (let (files dirs)
+          (dolist (database (seq-uniq (project-x-compile-commands-files project)))
+            (let ((entries (project-x--json-read-file database)))
+              (push (project-x--compile-command-files database entries) files)
+              (push (project-x--compile-command-include-dirs database entries)
+                    dirs)))
+          (setq cached
+                (list :files (seq-uniq (apply #'append (nreverse files)))
+                      :include-dirs (seq-uniq (apply #'append (nreverse dirs)))))
+          (puthash projx cached project-x--compile-metadata-cache)
+          cached))))
+
 (defun project-x--explicit-files (project)
   "Return explicit files from PROJECT."
   (let ((files (project-x--string-list
@@ -390,8 +502,7 @@ Relative paths are resolved against BASE, or the project root."
                          (let ((expanded (expand-file-name file)))
                            (and (file-exists-p expanded) expanded))))
                   (project-x--string-list
-                   (project-x--json-read-file project-files))))
-     #'string-equal)))
+                   (project-x--json-read-file project-files)))))))
 
 (defun project-x--all-files (project)
   "Return all files for PROJECT."
@@ -404,9 +515,8 @@ Relative paths are resolved against BASE, or the project root."
                        (project-x--folder-files project)
                        (seq-mapcat #'project-x--generated-project-files
                                    (project-x-project-files-files project))
-                       (seq-mapcat #'project-x--compile-command-files
-                                   (project-x-compile-commands-files project)))
-                      #'string-equal)))
+                       (plist-get (project-x--imported-compile-metadata project)
+                                  :files)))))
           (puthash projx files project-x--files-cache)
           files))))
 
@@ -417,8 +527,7 @@ Relative paths are resolved against BASE, or the project root."
     (or cached
         (let ((dirs (seq-uniq
                     (delq nil (mapcar #'file-name-directory
-                                       (project-x--all-files project)))
-                    #'string-equal)))
+                                       (project-x--all-files project))))))
           (puthash projx dirs project-x--source-dirs-cache)
           dirs))))
 
@@ -427,10 +536,8 @@ Relative paths are resolved against BASE, or the project root."
   (let* ((projx (project-x-file project))
          (cached (gethash projx project-x--include-dirs-cache)))
     (or cached
-        (let ((dirs (seq-uniq
-                    (seq-mapcat #'project-x--compile-command-include-dirs
-                                (project-x-compile-commands-files project))
-                    #'string-equal)))
+        (let ((dirs (plist-get (project-x--imported-compile-metadata project)
+                               :include-dirs)))
           (puthash projx dirs project-x--include-dirs-cache)
           dirs))))
 
@@ -791,6 +898,7 @@ revisiting an already open buffer does not run `find-file-hook'."
   (setq project-x--active-project project)
   (project-x--set-buffer-project project)
   (project-remember-project project)
+  (project-x--remember-project-file (project-x-file project))
   (project-x--apply-lsp-args project)
   (message "Activated project-x project: %s" (project-x-name project))
   (force-mode-line-update t)
@@ -812,6 +920,40 @@ revisiting an already open buffer does not run `find-file-hook'."
     (project-x-activate project)
     (dired (project-x-root project))
     (project-x--set-buffer-project project)))
+
+(defun project-x-open-recent ()
+  "Open a recently activated project-x project."
+  (interactive)
+  (let* ((files (project-x--recent-project-candidates))
+         (choices
+          (mapcar (lambda (file)
+                    (let ((project (project-x-load file)))
+                      (cons (project-x--project-display-name project) file)))
+                  files)))
+    (unless choices
+      (user-error "No recent project-x projects"))
+    (project-x-open
+     (cdr (assoc (completing-read "Recent project-x: " choices nil t)
+                 choices)))))
+
+(defun project-x-close ()
+  "Deactivate the active project-x project and detach its buffers.
+
+Existing LSP sessions continue running.  Restarting LSP is only necessary
+when a buffer must use a different project-x compile context."
+  (interactive)
+  (unless project-x--active-project
+    (user-error "No active project-x project"))
+  (let* ((project project-x--active-project)
+         (name (project-x-name project)))
+    (setq project-x--active-project nil)
+    (dolist (buffer (buffer-list))
+      (with-current-buffer buffer
+        (when (eq project-x-buffer-project project)
+          (setq-local project-x-buffer-project nil)
+          (project-x--refresh-mode-line-cache t))))
+    (force-mode-line-update t)
+    (message "Closed project-x project: %s" name)))
 
 (defun project-x--read-active-project ()
   "Return the active project-x project, or ask for one."
@@ -907,6 +1049,171 @@ revisiting an already open buffer does not run `find-file-hook'."
         (json-pretty-print-buffer)))
     output))
 
+(defun project-x--compile-command-source (entry database-directory)
+  "Resolve ENTRY's source against its working and DATABASE-DIRECTORY."
+  (let ((file (project-x--hash-get entry "file"))
+        (directory (project-x--hash-get entry "directory")))
+    (unless (and (stringp file) (stringp directory))
+      (error "Invalid compile command: file and directory must be strings"))
+    (expand-file-name file (expand-file-name directory database-directory))))
+
+(defun project-x--c-source-p (file)
+  "Return non-nil when FILE has a C or C++ source extension."
+  (member (downcase (or (file-name-extension file) ""))
+          '("c" "cc" "cpp" "cxx" "c++")))
+
+(defun project-x--bulk-source-includes (file)
+  "Read direct literal source includes from FILE, without preprocessing it.
+Return plists with :path, :line and :reason.  Conditional and angle-bracket
+includes have a reason and must not supply derived compile commands."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (while (re-search-forward "\\\\\r?\n" nil t)
+      (replace-match "" t t))
+    (goto-char (point-min))
+    (when (re-search-forward
+           "^[ \t]*#[ \t]*include[^\n]*\\.[cC][^\"<>\n]*[\">]" nil t)
+      ;; CC Mode handles comments and C++ raw strings; never run user hooks.
+      (delay-mode-hooks (c++-mode))
+      (goto-char (point-min))
+      (let ((case-fold-search nil)
+            (depth 0)
+            includes)
+        (while (re-search-forward "^[ \t]*#[ \t]*\\([a-z]+\\)\\_>" nil t)
+          (let ((directive (match-string-no-properties 1))
+                (start (match-beginning 0))
+                (rest (buffer-substring-no-properties (match-end 0)
+                                                      (line-end-position)))
+                (line (line-number-at-pos)))
+            (unless (save-excursion (nth 8 (syntax-ppss start)))
+              (cond
+               ((member directive '("if" "ifdef" "ifndef")) (cl-incf depth))
+               ((member directive '("elif" "else"))
+                (when (zerop depth)
+                  (error "Unmatched #%s in %s:%d" directive file line)))
+               ((equal directive "endif")
+                (when (zerop depth)
+                  (error "Unmatched #endif in %s:%d" file line))
+                (cl-decf depth))
+               ((and (equal directive "include")
+                     (string-match
+                      "\\`[ \t]*\\(?:\"\\([^\"]+\\)\"\\|<\\([^>]+\\)>\\)" rest))
+                (let* ((quoted (match-string 1 rest))
+                       (include (or quoted (match-string 2 rest))))
+                  (when (project-x--c-source-p include)
+                    (push (list :path (expand-file-name
+                                       include (file-name-directory file))
+                                :line line
+                                :reason (cond
+                                         ((> depth 0) "conditional include")
+                                         ((not quoted) "angle-bracket include")))
+                          includes))))))))
+        (unless (zerop depth)
+          (error "Unterminated preprocessor conditional in %s" file))
+        (nreverse includes)))))
+
+(defun project-x--derive-bulk-command (entry source database-directory)
+  "Copy bulk ENTRY for SOURCE, or signal an error if copying is unsafe.
+DATABASE-DIRECTORY resolves relative paths.  Only argument arrays with one
+standalone source operand are supported; shell commands are never reparsed."
+  (let* ((arguments (project-x--hash-get entry "arguments"))
+         (args (and (or (vectorp arguments) (listp arguments))
+                    (append arguments nil)))
+         (owner (project-x--compile-command-source entry database-directory))
+         (directory (expand-file-name (gethash "directory" entry)
+                                      database-directory))
+         (matches 0))
+    (unless (and args (seq-every-p #'stringp args))
+      (error "Bulk command needs a nonempty string arguments array"))
+    (when (seq-some (lambda (arg) (or (string-prefix-p "@" arg)
+                                    (string-prefix-p "/Yc" arg))) args)
+      (error "Response files and PCH creation commands cannot be copied"))
+    (setq args
+          (mapcar
+           (lambda (arg)
+             (if (and (project-x--c-source-p arg)
+                      (project-x--same-file-p
+                       (expand-file-name arg directory) owner))
+                 (progn (cl-incf matches) source)
+               arg))
+           args))
+    (unless (= matches 1)
+      (error "Bulk command needs exactly one standalone source operand"))
+    (let ((derived (copy-hash-table entry)))
+      (puthash "file" source derived)
+      (puthash "directory" directory derived)
+      (puthash "arguments" (vconcat args) derived)
+      (remhash "command" derived)
+      (remhash "output" derived)
+      derived)))
+
+(defun project-x--augment-bulk-commands (entries database-directory)
+  "Supplement ENTRIES with direct bulk-included source commands.
+DATABASE-DIRECTORY resolves relative paths.  Return :entries, :added and
+:warnings.  Existing commands win; conditional or multiple owners are skipped."
+  (unless (vectorp entries)
+    (error "Compilation database must be a JSON array"))
+  (let ((existing (make-hash-table :test 'equal))
+        (owners (make-hash-table :test 'equal))
+        additions warnings)
+    (seq-doseq (entry entries)
+      (puthash (project-x--path-key
+                (project-x--compile-command-source entry database-directory))
+               t existing))
+    (seq-doseq (entry entries)
+      (let ((file (project-x--compile-command-source entry database-directory)))
+        (when (project-x--c-source-p file)
+          (cond
+           ((or (file-remote-p file) (not (file-regular-p file))
+                (not (file-readable-p file)))
+            (push (format "Cannot inspect compiled source: %s" file) warnings))
+           (t
+            (dolist (include (project-x--bulk-source-includes file))
+              (let* ((source (plist-get include :path))
+                     (key (project-x--path-key source)))
+                (unless (gethash key existing)
+                  (let ((candidate (cons entry include)))
+                    (cl-pushnew
+                     candidate (gethash key owners)
+                     :test (lambda (a b)
+                             (and (eq (car a) (car b))
+                                  (equal (plist-get (cdr a) :reason)
+                                         (plist-get (cdr b) :reason))))))))))))))
+    (maphash
+     (lambda (_key candidates)
+       (let* ((include (cdar candidates))
+              (source (plist-get include :path))
+              (reason
+               (cond
+                ((length> candidates 1) "multiple or conditional bulk owners")
+                ((plist-get include :reason))
+                ((or (file-remote-p source) (not (file-regular-p source))
+                     (not (file-readable-p source)))
+                 "included source is not readable"))))
+         (if reason
+             (push (format
+                    "Skipped %s: %s (%s)" source reason
+                    (mapconcat
+                     (lambda (candidate)
+                       (format "%s:%d"
+                               (gethash "file" (car candidate))
+                               (plist-get (cdr candidate) :line)))
+                     candidates ", "))
+                   warnings)
+           (condition-case err
+               (push (project-x--derive-bulk-command
+                      (caar candidates) source database-directory)
+                     additions)
+             (error
+              (push (format "Skipped %s: %s" source (error-message-string err))
+                    warnings))))))
+     owners)
+    (setq additions (nreverse additions))
+    (list :entries (vconcat entries additions)
+          :added (length additions)
+          :warnings (nreverse warnings))))
+
 (defun project-x--refresh-vs-solution-import (project import)
   "Refresh Visual Studio solution IMPORT for PROJECT."
   (let* ((solution (project-x--expand-path project
@@ -925,22 +1232,125 @@ revisiting an already open buffer does not run `find-file-hook'."
     (unless (and solution (file-exists-p solution))
       (user-error "Solution does not exist: %s" solution))
     (make-directory output-dir t)
+    (make-directory (file-name-directory project-files) t)
     (with-current-buffer buffer
-      (erase-buffer)
+      (goto-char (point-max))
       (insert (format "Running %s\n" extractor)))
-    (let ((status (call-process extractor nil buffer t
-                                "--solution" solution
-                                "-c" configuration
-                                "-a" platform
-                                "-o" output)))
-      (if (zerop status)
+    (let (staged-output staged-files complete)
+      (unwind-protect
           (progn
-            (project-x--refresh-vs-project-files solution project-files)
+            (setq staged-output
+                  (make-temp-file (expand-file-name ".project-x-compile-" output-dir)
+                                  nil ".json")
+                  staged-files
+                  (make-temp-file
+                   (expand-file-name ".project-x-files-"
+                                     (file-name-directory project-files))
+                   nil ".json"))
+            (let ((status (call-process extractor nil buffer t
+                                        "--solution" solution
+                                        "-c" configuration
+                                        "-a" platform
+                                        "-o" staged-output)))
+              (unless (and (integerp status) (zerop status))
+                (user-error "project-x extractor failed (%s); see %s"
+                            status (buffer-name buffer))))
+            (let* ((entries (project-x--json-read-file staged-output))
+                   (result (project-x--augment-bulk-commands entries output-dir))
+                   (warnings (plist-get result :warnings))
+                   (coding-system-for-write 'utf-8-unix))
+              (with-temp-file staged-output
+                (insert (json-encode (plist-get result :entries))))
+              (project-x--refresh-vs-project-files solution staged-files)
+              (with-current-buffer buffer
+                (goto-char (point-max))
+                (insert (format "\nBulk commands: added %d; warnings %d\n"
+                                (plist-get result :added) (length warnings)))
+                (dolist (warning warnings) (insert warning "\n")))
+              (rename-file staged-files project-files t)
+              (rename-file staged-output output t)
+              (setq complete t))
             (project-x--clear-project-derived-caches project)
             (message "Updated %s and %s" output project-files)
             output)
-        (display-buffer buffer)
-        (user-error "project-x refresh failed; see %s" (buffer-name buffer))))))
+        (dolist (file (list staged-output staged-files))
+          (when (and file (file-exists-p file)) (delete-file file)))
+        (unless complete
+          (with-current-buffer buffer
+            (goto-char (point-max))
+            (insert "\nRefresh failed; compilation database was not replaced.\n"))
+          (display-buffer buffer))))))
+
+(defun project-x--buffer-project-p (project)
+  "Return non-nil if the current buffer is associated with PROJECT."
+  (and project-x-buffer-project
+       (project-x--same-file-p (project-x-file project-x-buffer-project)
+                               (project-x-file project))))
+
+(defun project-x--refresh-lsp-workspaces (project)
+  "Collect distinct running clangd workspaces in PROJECT's file buffers."
+  (when (and project-x-refresh-restart-lsp (featurep 'lsp-mode))
+    (let (workspaces)
+      (dolist (buffer (buffer-list))
+        (with-current-buffer buffer
+          (when (and buffer-file-name (project-x--buffer-project-p project))
+            (dolist (workspace (lsp-workspaces))
+              (let ((process (lsp--workspace-proc workspace)))
+                (when (and (eq (lsp--workspace-server-id workspace) 'clangd)
+                           (processp process) (process-live-p process))
+                  (cl-pushnew workspace workspaces :test #'eq)))))))
+      (nreverse workspaces))))
+
+(defun project-x--restart-refresh-workspaces (project workspaces)
+  "Request restarts of WORKSPACES after refreshing PROJECT.
+Return counts under :requested, :skipped and :failed.  Restart failures
+are reported separately from the already published compilation database."
+  (let ((requested 0) (skipped 0) (failed 0))
+    (with-current-buffer (get-buffer-create "*project-x-refresh*")
+      (dolist (workspace workspaces)
+        (let* ((process (lsp--workspace-proc workspace))
+               (root (lsp--workspace-root workspace))
+               (others
+                (delq nil
+                      (mapcar
+                       (lambda (buffer)
+                         (when (buffer-live-p buffer)
+                           (with-current-buffer buffer
+                             (when (and buffer-file-name
+                                        (not (project-x--buffer-project-p project)))
+                               (buffer-name)))))
+                       (lsp--workspace-buffers workspace)))))
+          (goto-char (point-max))
+          (cond
+           ((not (and (processp process) (process-live-p process)))
+            (cl-incf skipped)
+            (insert (format "LSP skipped: clangd at %s is no longer running.\n" root)))
+           ((and others
+                 (not (and (not noninteractive)
+                           (y-or-n-p
+                            (format "Restart clangd at %s? Also affects %d other buffer(s): %s "
+                                    root (length others) (string-join others ", "))))))
+            (cl-incf skipped)
+            (insert (format "LSP skipped: shared clangd at %s (%s).\n"
+                            root (string-join others ", "))))
+           (t
+            (condition-case err
+                (progn
+                  (lsp-workspace-restart workspace)
+                  (cl-incf requested)
+                  (goto-char (point-max))
+                  (insert (format "LSP restart requested: clangd at %s.\n" root)))
+              (error
+               (cl-incf failed)
+               (let ((text (format "LSP restart failed at %s: %s"
+                                   root (error-message-string err))))
+                 (goto-char (point-max))
+                 (insert text "\n")
+                 (display-warning 'project-x text :warning))))))))
+      (goto-char (point-max))
+      (insert (format "LSP restarts: %d requested; %d skipped; %d failed.\n"
+                      requested skipped failed)))
+    (list :requested requested :skipped skipped :failed failed)))
 
 ;;;###autoload
 (defun project-x-refresh (&optional project)
@@ -948,14 +1358,26 @@ revisiting an already open buffer does not run `find-file-hook'."
   (interactive)
   (let* ((project (or project (project-x--read-active-project)))
          (imports (project-x--imports project))
+         (workspaces (project-x--refresh-lsp-workspaces project))
          (outputs nil))
+    (with-current-buffer (get-buffer-create "*project-x-refresh*")
+      (erase-buffer)
+      (insert (format "Refreshing %s\n" (project-x-name project))))
     (dolist (import imports)
       (pcase (project-x--hash-get import "type")
         ("visual-studio-solution"
          (push (project-x--refresh-vs-solution-import project import) outputs))
         (_ nil)))
     (project-x--clear-project-derived-caches project)
-    (message "project-x refresh complete: %d output(s)" (length outputs))
+    (let ((result (when outputs
+                    (project-x--restart-refresh-workspaces project workspaces))))
+      (message (concat "project-x DB refresh complete: %d output(s); "
+                       "LSP restarts %d requested, %d skipped, %d failed; "
+                       "see *project-x-refresh*")
+               (length outputs)
+               (or (plist-get result :requested) 0)
+               (or (plist-get result :skipped) 0)
+               (or (plist-get result :failed) 0)))
     (nreverse outputs)))
 
 ;;;###autoload
